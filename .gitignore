@@ -1,0 +1,21 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Raw and processed data
+data/raw/
+data/processed/
+data/interim/
+data/external/
+
+# Outputs
+outputs/
+figures/
+
+# Large data files
+*.rds
+*.csv
+*.dta
+*.sav
+*.xlsx

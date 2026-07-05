@@ -1,0 +1,344 @@
+---
+title: "Pooled zero-dose estimates: SME + DHIS2"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 8
+    theme: cosmo
+execute:
+  warning: false
+  message: true
+  cache: false
+params:
+  rebuild_data: false    # TRUE = rerun raw DHS/GPS/covariate builds (needs data/raw)
+  refit_models: false    # TRUE = refit INLA models even if inla_fits.rds exists
+  run_cv: false          # TRUE = run the spatial 10-fold CV (slow: 10 INLA refits)
+---
+
+# Pooling with DHIS2 administrative data: counts and comparison maps
+
+Self-contained: uses `combined`, `adm3_sum`, `adm1_ocha`, `theme_map`, and
+`save_map` if they already exist in your session (e.g. pasted into the main
+pipeline after "Stage 2 maps"), otherwise loads/builds them from disk so this
+file also renders standalone with `quarto preview
+pooled_zero_dose_mapping_section.qmd`.
+
+**Edit the paths in `setup-pooled` to match your project** - the four you
+need are the SME csv, the two DHIS2 workbooks, and (only if `adm3_sum` /
+`adm1_ocha` don't already exist in your session) the admin-3 shapefile and
+admin-1 boundary file.
+
+```{r setup-pooled}
+#| message: false
+suppressMessages({
+  library(readxl); library(dplyr); library(stringr); library(stringdist)
+  library(tidyr); library(readr); library(sf); library(ggplot2); library(scales)
+})
+
+## ---- 1. Paths (EDIT THESE to match your project) -----------------------------
+sme_path        <- "data/final_two_stage_estimates.csv"
+dhis2_new_path  <- "data/Zero_dose DHIS2 prevalence.xlsx"   # BoFED + DHIS2 names
+dhis2_old_path  <- "data/Penta_updated33_for_modeling.xlsx" # used only to recover Region
+
+## only used if adm3_sum / adm1_ocha aren't already in your session
+path_adm3_shp   <- "data/raw/eth_admin_boundaries.shp/eth_admin3.shp" 
+path_adm1_ocha  <- "data/raw/eth_admin_boundaries.shp/eth_admin1.shp"
+
+out_final <- "data/clean/merged_dhis2_final.csv"
+dir.create(dirname(out_final), showWarnings = FALSE, recursive = TRUE)
+
+FUZZY_THRESHOLD <- 0.90  # Jaro-Winkler similarity for the fuzzy passes
+
+## ---- 2. Bring in combined / adm3_sum / adm1_ocha / theme_map / save_map ------
+## Re-use them if this chunk is running inside the main pipeline session;
+## otherwise build/load them here so the file also renders on its own.
+if (!exists("combined")) {
+  message("`combined` not found in session -> reading from ", sme_path)
+  combined <- read_csv(sme_path, show_col_types = FALSE)
+}
+
+if (!exists("adm3_sum")) {
+  message("`adm3_sum` not found in session -> reading shapefile from ", path_adm3_shp)
+  adm3_sum <- read_sf(path_adm3_shp) %>%
+    transmute(woreda_id = adm3_pcode)
+}
+
+if (!exists("adm1_ocha")) {
+  message("`adm1_ocha` not found in session -> reading from ", path_adm1_ocha)
+  adm1_ocha <- read_sf(path_adm1_ocha)
+}
+
+if (!exists("theme_map")) {
+  theme_map <- theme_void(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+          plot.subtitle = element_text(hjust = 0.5, size = 10, colour = "grey30"),
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.key.width = unit(1.4, "cm"),
+          legend.title = element_text(size = 9, vjust = 0.8),
+          plot.caption = element_text(size = 8, colour = "grey40"))
+}
+
+if (!exists("save_map")) {
+  dir.create("data/clean/pipeline/maps", showWarnings = FALSE, recursive = TRUE)
+  save_map <- function(p, f, w = 9, h = 8)
+    ggsave(file.path("data/clean/pipeline/maps", f), p,
+           width = w, height = h, dpi = 300, bg = "white")
+}
+```
+
+We match DHIS2 rows to your 1148-woreda SAE frame using **two** name
+candidates per DHIS2 row - the BoFED name (`ADM3_EN_Bofed`, which tends to
+match your SME frame's own naming convention) and the DHIS2 name
+(`Woreda_DHIS2`, the fallback). A BoFED name that repeats within the same
+zone is flagged unreliable (broken fill-down in the source file) and skipped
+in favour of the DHIS2 name for that row. Region isn't in the new DHIS2
+file, so it's recovered via a bridge join against the old Penta workbook,
+which shares the same Zone/Woreda naming.
+
+```{r dhis2-crosswalk}
+#| message: false
+sme <- read.csv(sme_path, stringsAsFactors = FALSE)
+
+dhis2_new <- read_excel(dhis2_new_path, sheet = "Sheet1") %>%
+  rename(
+    zone_d    = Zone_DHIS2,
+    bofed_d   = ADM3_EN_Bofed,
+    woreda_d  = Woreda_DHIS2,
+    lon_d     = Longitd,
+    lat_d     = Latitud,
+    penta1    = `Penta1_2025`,           # numerator; header is oddly just the year in your file
+    SI        = SI_2025,
+    coverage  = `Coverage 2025`,
+    zero_dose_admin_raw = `zero dose prevalence`) %>%
+  mutate(row_id_dhis2 = row_number())
+
+dhis2_old <- read_excel(dhis2_old_path, sheet = "Sheet1") %>%
+  rename(region_old = Region, zone_old = Zone, woreda_old = Woreda)
+
+clean_name <- function(x) {
+  x <- tolower(as.character(x))
+  x <- str_replace_all(x, "[\\/\\-\\(\\)]", " ")
+  drop_words <- c(
+    "woreda", "wereda", "zone", "region", "regional health bureau",
+    "city administration", "sub city", "subcity", "administration",
+    "special", "town", "city admin", "city", "kentiba", "health office",
+    "health department"
+  )
+  for (w in drop_words) x <- str_replace_all(x, fixed(w), " ")
+  str_squish(x)
+}
+
+normalize_region <- function(x) {
+  x <- clean_name(x)
+  case_when(
+    str_detect(x, "gambel")                ~ "gambela",
+    str_detect(x, "benishangul")           ~ "benishangul-gumuz",
+    str_detect(x, "central ethiop")        ~ "central ethiopia",
+    str_detect(x, "south west")            ~ "south west ethiopia",
+    str_detect(x, "^south ethiop")         ~ "south ethiopia",
+    str_detect(x, "dire dawa")             ~ "dire dawa",
+    str_detect(x, "addis ababa")           ~ "addis ababa",
+    TRUE                                   ~ x
+  )
+}
+
+## Bridge new file -> old file to recover Region (both use DHIS2 naming, so
+## this is a clean, high-confidence exact join)
+dhis2_new <- dhis2_new %>%
+  mutate(zone_clean_dhis2 = clean_name(zone_d), woreda_clean_dhis2 = clean_name(woreda_d))
+
+old_key <- dhis2_old %>%
+  mutate(zone_clean_dhis2 = clean_name(zone_old), woreda_clean_dhis2 = clean_name(woreda_old)) %>%
+  select(zone_clean_dhis2, woreda_clean_dhis2, region_old) %>%
+  distinct(zone_clean_dhis2, woreda_clean_dhis2, .keep_all = TRUE)
+
+dhis2_new <- dhis2_new %>%
+  left_join(old_key, by = c("zone_clean_dhis2", "woreda_clean_dhis2")) %>%
+  mutate(region_clean = normalize_region(region_old))
+
+n_no_region <- sum(is.na(dhis2_new$region_clean))
+message("DHIS2 rows where Region could not be recovered via the bridge: ",
+        n_no_region, " / ", nrow(dhis2_new))
+
+## Flag BoFED-name reliability: unreliable if it repeats within its zone
+dhis2_new <- dhis2_new %>%
+  mutate(bofed_clean = clean_name(bofed_d)) %>%
+  group_by(zone_clean_dhis2, bofed_clean) %>%
+  mutate(bofed_reliable = n() == 1 & !is.na(bofed_clean) & bofed_clean != "") %>%
+  ungroup()
+
+message("DHIS2 rows with a trustworthy (non-repeated) BoFED name: ",
+        sum(dhis2_new$bofed_reliable), " / ", nrow(dhis2_new))
+
+sme <- sme %>%
+  mutate(row_id_sme = row_number(),
+         region_clean = normalize_region(region),
+         woreda_clean = clean_name(woreda))
+
+sort_words <- function(s) paste(sort(str_split(s, " ")[[1]]), collapse = " ")
+
+## try_pool(): exact match; if none, fuzzy match with a margin check so we
+## don't silently pick an arbitrary winner among several close candidates.
+try_pool <- function(wname, cand_names, cand_ids, tag) {
+  if (length(cand_names) == 0) return(NULL)
+
+  exact_idx <- which(cand_names == wname)
+  if (length(exact_idx) == 1) {
+    return(list(row_id_dhis2 = cand_ids[exact_idx], match_type = paste0(tag, "_exact"), similarity = 1))
+  }
+  if (length(exact_idx) > 1) {
+    return(list(row_id_dhis2 = cand_ids[exact_idx[1]],
+                match_type = paste0(tag, "_ambiguous_exact"), similarity = 1))
+  }
+
+  wname_sorted <- sort_words(wname)
+  cand_sorted  <- vapply(cand_names, sort_words, character(1))
+  sims <- stringsim(wname_sorted, cand_sorted, method = "jw", p = 0.1)
+  best_idx <- which.max(sims); best_sim <- sims[best_idx]
+  sims_sorted <- sort(sims, decreasing = TRUE)
+  margin_ok <- length(sims_sorted) < 2 || (sims_sorted[1] - sims_sorted[2] > 0.03)
+
+  if (best_sim >= FUZZY_THRESHOLD && margin_ok) {
+    return(list(row_id_dhis2 = cand_ids[best_idx], match_type = paste0(tag, "_fuzzy"), similarity = best_sim))
+  }
+  if (best_sim >= FUZZY_THRESHOLD && !margin_ok) {
+    return(list(row_id_dhis2 = cand_ids[best_idx],
+                match_type = paste0(tag, "_ambiguous_fuzzy"), similarity = best_sim))
+  }
+  NULL
+}
+
+match_records <- vector("list", nrow(sme))
+for (i in seq_len(nrow(sme))) {
+  reg   <- sme$region_clean[i]
+  wname <- sme$woreda_clean[i]
+  pool  <- dhis2_new %>% filter(region_clean == reg)
+
+  if (nrow(pool) == 0) {
+    match_records[[i]] <- data.frame(row_id_sme = sme$row_id_sme[i], row_id_dhis2 = NA_integer_,
+                                      match_type = "unmatched_no_region", similarity = NA_real_)
+    next
+  }
+
+  rel_pool <- pool %>% filter(bofed_reliable)
+  res <- try_pool(wname, rel_pool$bofed_clean, rel_pool$row_id_dhis2, "bofed")
+  if (is.null(res)) res <- try_pool(wname, pool$woreda_clean_dhis2, pool$row_id_dhis2, "dhis2name")
+
+  if (is.null(res)) {
+    match_records[[i]] <- data.frame(row_id_sme = sme$row_id_sme[i], row_id_dhis2 = NA_integer_,
+                                      match_type = "unmatched_no_similar_name", similarity = NA_real_)
+  } else {
+    match_records[[i]] <- data.frame(row_id_sme = sme$row_id_sme[i], row_id_dhis2 = res$row_id_dhis2,
+                                      match_type = res$match_type, similarity = res$similarity)
+  }
+}
+crosswalk <- bind_rows(match_records)
+
+message("--- Matching summary ---")
+print(table(crosswalk$match_type))
+message("Total SME woredas: ", nrow(sme))
+```
+
+```{r dhis2-pooled-counts}
+dhis2_small <- dhis2_new %>%
+  select(row_id_dhis2, zone_d, bofed_d, woreda_d, lon_d, lat_d,
+         penta1, SI, coverage, zero_dose_admin_raw)
+
+merged <- sme %>%
+  left_join(crosswalk, by = "row_id_sme") %>%
+  left_join(dhis2_small, by = "row_id_dhis2") %>%
+  mutate(
+    zero_dose_prev_dhis2 = ifelse(is.na(zero_dose_admin_raw), NA_real_,
+                                   pmax(zero_dose_admin_raw, 0)),   # defensive re-clip
+    zero_dose_count_sme   = ifelse(!is.na(SI), final_estimate * SI, NA_real_),
+    zero_dose_count_dhis2 = ifelse(!is.na(SI), zero_dose_prev_dhis2 * SI, NA_real_),
+    pooled_zero_dose_prev = rowMeans(cbind(final_estimate, zero_dose_prev_dhis2), na.rm = TRUE),
+    pooled_zero_dose_count = ifelse(!is.na(SI), pooled_zero_dose_prev * SI, NA_real_),
+    matched_to_dhis2 = !is.na(row_id_dhis2)
+  )
+
+## `pooled_out` is the table the map chunks below join to `adm3_sum` - keep
+## `final_estimate` under its own name too (`sme_zero_dose_prev`) but also
+## keep the original column so both naming styles work.
+pooled_out <- merged %>%
+  select(
+    woreda_id, region, zone, woreda,
+    sme_zero_dose_prev = final_estimate,
+    sme_lo = final_lo, sme_hi = final_hi,
+    reliability, estimate_source,
+    matched_to_dhis2, match_type, match_similarity = similarity,
+    dhis2_zone = zone_d, dhis2_bofed_name = bofed_d, dhis2_woreda_name = woreda_d,
+    penta1, SI, coverage,
+    dhis2_zero_dose_prev = zero_dose_prev_dhis2,
+    zero_dose_count_sme, zero_dose_count_dhis2,
+    pooled_zero_dose_prev, pooled_zero_dose_count
+  )
+
+write.csv(pooled_out, out_final, row.names = FALSE, na = "")
+message("Woredas with a usable SI (count computed): ", sum(!is.na(pooled_out$SI)),
+        " / ", nrow(pooled_out))
+```
+
+## Maps
+
+```{r map-pooled-count}
+#| fig-width: 9
+#| fig-height: 8
+map_sf_pooled <- adm3_sum %>% select(woreda_id) %>% left_join(pooled_out, by = "woreda_id")
+
+p10 <- ggplot(map_sf_pooled) +
+  geom_sf(aes(fill = pooled_zero_dose_count), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "inferno", direction = -1, na.value = "grey85",
+                       name = "Estimated\nzero-dose\nchildren") +
+  labs(title = "Estimated zero-dose children (12-23m), pooled SME + DHIS2",
+       subtitle = "Pooled prevalence x DHIS2 Survived-Infant denominator",
+       caption = "Grey = no DHIS2 match / no usable SI yet; count left blank pending full population data") +
+  theme_map
+save_map(p10, "map_pooled_zero_dose_count.png")
+p10
+```
+
+```{r map-pooled-prevalence}
+#| fig-width: 9
+#| fig-height: 8
+p11 <- ggplot(map_sf_pooled) +
+  geom_sf(aes(fill = pooled_zero_dose_prev), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1), name = "Pooled\nprevalence") +
+  labs(title = "Pooled zero-dose prevalence: SME (BYM2) + DHIS2 administrative data",
+       subtitle = "Simple average of SME and DHIS2 prevalence where matched; SME-only elsewhere") +
+  theme_map
+save_map(p11, "map_pooled_prevalence.png")
+p11
+```
+
+```{r map-predicted-vs-pooled}
+#| fig-width: 12
+#| fig-height: 7
+comp_df2 <- bind_rows(
+  map_sf_pooled %>% mutate(val = sme_zero_dose_prev,    panel = "SME predicted (BYM2)"),
+  map_sf_pooled %>% mutate(val = pooled_zero_dose_prev, panel = "Pooled (SME + DHIS2)"))
+
+p12 <- ggplot(comp_df2) +
+  geom_sf(aes(fill = val), colour = NA) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.3) +
+  facet_wrap(~panel) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1), name = "Prevalence") +
+  labs(title = "SME predicted vs pooled (SME + DHIS2) zero-dose prevalence",
+       subtitle = "Panels are identical wherever no DHIS2 match was found; pooling shifts\nestimates only in matched woredas") +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 10, colour = "grey30"),
+        legend.position = "bottom")
+save_map(p12, "map_predicted_vs_pooled.png", w = 12, h = 7)
+p12
+```

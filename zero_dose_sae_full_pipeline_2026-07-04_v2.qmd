@@ -1,0 +1,1318 @@
+---
+title: "Zero-Dose Children in Ethiopia: Two-Stage Small Area Estimation, Full Pipeline"
+subtitle: "EDHS 2011/2016/2019 pooled | Stage 1 direct estimates + Stage 2 Bayesian BYM2 (R-INLA) | All 1,148 OCHA woredas"
+author: "C4ED Ethiopia | NDMC Public Health Policy Modeling Hackathon, Challenge 1"
+date: 2026-07-04
+format:
+  docx:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 8
+    theme: cosmo
+execute:
+  warning: false
+  message: true
+  cache: false
+params:
+  rebuild_data: false    # TRUE = rerun raw DHS/GPS/covariate builds (needs data/raw)
+  refit_models: false    # TRUE = refit INLA models even if inla_fits.rds exists
+  run_cv: false          # TRUE = run the spatial 10-fold CV (slow: 10 INLA refits)
+---
+
+::: {.callout-note}
+## How to use this document
+
+This single Quarto file consolidates the entire pipeline (scripts 00 to 08) in
+order: data build, woreda join, descriptives, Stage 1 direct estimates,
+covariate build, Stage 2 INLA models, predictions for all woredas, and
+validation. All tables are produced with `gtsummary`/`gt` in publishable
+format. Render it from the project root (the folder containing `data/`).
+
+Heavy steps are guarded by parameters so a default render is fast and reuses
+saved outputs. To rerun everything from raw data:
+
+`quarto render zero_dose_sae_full_pipeline_2026-07-04.qmd -P rebuild_data:true -P refit_models:true -P run_cv:true`
+:::
+
+# Setup
+
+```{r setup}
+#| message: false
+suppressMessages({
+  library(tidyverse); library(haven); library(labelled)
+  library(sf); library(spdep); library(survey); library(scales)
+  library(readxl); library(gtsummary); library(gt)
+})
+# INLA is loaded in the Stage 2 section (not on CRAN):
+# install.packages("INLA", repos = c(getOption("repos"),
+#   INLA = "https://inla.r-inla-download.org/R/stable"), dep = TRUE)
+
+sf_use_s2(FALSE)
+options(survey.lonely.psu = "adjust")
+set.seed(20260703)
+
+# Publishable gtsummary styling
+theme_gtsummary_journal("jama")
+theme_gtsummary_compact()
+
+for (d in c("", "tables", "figures", "maps"))
+  dir.create(file.path("data/clean/pipeline", d),
+             showWarnings = FALSE, recursive = TRUE)
+
+# Shared map theme
+theme_map <- theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 10, colour = "grey30"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.key.width = unit(1.4, "cm"),
+        legend.title = element_text(size = 9, vjust = 0.8),
+        plot.caption = element_text(size = 8, colour = "grey40"))
+save_map <- function(p, f, w = 9, h = 8)
+  ggsave(file.path("data/clean/pipeline/maps", f), p,
+         width = w, height = h, dpi = 300, bg = "white")
+```
+
+# 1. Data build: EDHS children's recode + GPS
+
+Outcome: zero dose = no DTP1/Penta1 (`h3`); "don't know" (`h3 == 8`) set to NA
+and excluded. Cohort: living children 12 to 23 months, EDHS 2011/2016/2019.
+
+```{r data-build}
+#| eval: !expr params$rebuild_data
+kr_vars <- c("v001","v002","v003","v005","v021","v022","v023","v024","v025",
+             "v008","b3","b5","b19","b4","bord","v106","v130","v190",
+             "h0","h2","h3","h4","h5","h7","h9","h10")
+
+read_kr <- function(path, year)
+  read_dta(path, col_select = any_of(kr_vars)) %>%
+  mutate(survey_year = year) %>% zap_labels()
+
+kr_raw <- bind_rows(
+    read_kr("data/raw/ETKR61FL.DTA", 2011L),
+    read_kr("data/raw/ETKR71FL.DTA", 2016L),
+    read_kr("data/raw/ETKR81FL.DTA", 2019L)) %>%
+  mutate(across(everything(), as.numeric))
+
+# 2011 has no b19; recover age from CMC dates (v008 - b3)
+child_all <- kr_raw %>%
+  mutate(
+    cluster     = as.integer(v001),
+    household   = as.integer(v002),
+    wt          = v005 / 1e6,
+    psu         = v021,
+    strata      = v023,
+    age_months  = as.integer(coalesce(b19, v008 - b3)),
+    alive       = b5 == 1,
+    dtp1_recd   = case_when(h3 %in% c(1, 2, 3) ~ 1L,
+                            h3 == 0            ~ 0L,
+                            TRUE               ~ NA_integer_),
+    zero_dose   = case_when(dtp1_recd == 1L ~ 0L,
+                            dtp1_recd == 0L ~ 1L,
+                            TRUE            ~ NA_integer_),
+    child_sex   = b4,
+    birth_order = as.integer(bord),
+    mother_educ = factor(v106, levels = 0:3,
+                         labels = c("none","primary","secondary","higher")),
+    wealth_q    = factor(v190, levels = 1:5,
+                         labels = c("poorest","poorer","middle","richer","richest")),
+    residence   = factor(v025, levels = c(1, 2), labels = c("urban","rural")),
+    region_code = as.integer(v024)) %>%
+  filter(alive, age_months >= 12, age_months <= 23) %>%
+  select(survey_year, cluster, household, wt, psu, strata, age_months,
+         child_sex, birth_order, mother_educ, wealth_q, residence,
+         region_code, dtp1_recd, zero_dose)
+
+message("Children 12-23 mo, living: ", nrow(child_all))
+
+# ---- GPS cluster points (drop (0,0) = unplaced) -----------------------------
+standardize_region <- function(x) {
+  x <- str_remove(str_trim(x), "\\s*Region$")
+  recode(x, "Gambella" = "Gambela", "Oromiya" = "Oromia",
+         "Benishangul Gumuz" = "Benishangul-Gumuz", .default = x)
+}
+read_gps <- function(path, year)
+  read_sf(path) %>% st_drop_geometry() %>%
+  transmute(survey_year = year, cluster = as.integer(DHSCLUST),
+            latnum = as.numeric(LATNUM), longnum = as.numeric(LONGNUM),
+            urban_rural = if_else(URBAN_RURA == "U", "urban", "rural"),
+            dhs_region  = standardize_region(as.character(ADM1NAME)))
+
+gps_tab <- bind_rows(
+    read_gps("data/raw/ETGE61FL/ETGE61FL.shp", 2011L),
+    read_gps("data/raw/ETGE71FL/ETGE71FL.shp", 2016L),
+    read_gps("data/raw/ETGE81FL/ETGE81FL.shp", 2019L)) %>%
+  filter(!(latnum == 0 & longnum == 0))
+
+# ---- Merge + aggregate to cluster level -------------------------------------
+child_merged <- child_all %>%
+  left_join(gps_tab, by = c("survey_year", "cluster")) %>%
+  filter(!is.na(latnum), !is.na(longnum))  # drops children in unplaced clusters
+
+cluster_level <- child_merged %>%
+  group_by(survey_year, cluster) %>%
+  summarise(
+    n_children  = sum(!is.na(zero_dose)),
+    n_zero_dose = sum(zero_dose, na.rm = TRUE),
+    prevalence  = if_else(n_children > 0, n_zero_dose / n_children, NA_real_),
+    latnum = first(latnum), longnum = first(longnum),
+    urban_rural = first(urban_rural), dhs_region = first(dhs_region),
+    .groups = "drop")
+
+message("Geolocated children: ", nrow(child_merged),
+        " | clusters: ", nrow(cluster_level))
+
+saveRDS(child_merged,  "data/clean/pipeline/child_prewored.rds")
+saveRDS(cluster_level, "data/clean/pipeline/cluster_prewored.rds")
+write_csv(cluster_level, "data/clean/pipeline/cluster_prewored.csv")
+```
+
+# 2. Cluster-to-woreda spatial join
+
+OCHA COD admin-3 geography (1,148 woredas, `adm3_pcode` key), the same
+geography as the covariate files, so covariates merge later with zero losses.
+Point-in-polygon join plus nearest-woreda snap for displaced points; a
+displacement-aware boundary flag is retained as a sensitivity marker only.
+
+```{r woreda-join}
+#| eval: !expr params$rebuild_data
+adm3 <- read_sf("data/raw/eth_admin_boundaries.shp/eth_admin3.shp") %>%
+  st_make_valid() %>%
+  transmute(region = adm1_name, zone = adm2_name, woreda = adm3_name,
+            woreda_id = adm3_pcode)
+
+cluster_level <- readRDS("data/clean/pipeline/cluster_prewored.rds")
+child_merged  <- readRDS("data/clean/pipeline/child_prewored.rds")
+
+cluster_sf <- cluster_level %>%
+  st_as_sf(coords = c("longnum", "latnum"), crs = 4326, remove = FALSE)
+
+# ---- Point-in-polygon, then snap leftovers to nearest woreda ----------------
+cluster_woreda <- st_join(cluster_sf, adm3, join = st_within, left = TRUE) %>%
+  mutate(snapped = if_else(is.na(woreda_id), 1L, 0L))
+
+if (any(cluster_woreda$snapped == 1L)) {
+  miss <- which(cluster_woreda$snapped == 1L)
+  idx  <- st_nearest_feature(cluster_woreda[miss, ], adm3)
+  fill <- st_drop_geometry(adm3)[idx, ]
+  cluster_woreda[miss, c("region","zone","woreda","woreda_id")] <- fill
+  message("Snapped ", length(miss), " cluster(s) to nearest woreda.")
+}
+stopifnot(!any(is.na(cluster_woreda$woreda_id)))
+
+# ---- Distance to nearest internal boundary (UTM 37N) ------------------------
+utm      <- 32637
+wbound_m <- adm3 %>% st_transform(utm) %>% st_boundary() %>% st_union()
+cluster_woreda <- cluster_woreda %>%
+  mutate(
+    dist_bound_km = as.numeric(st_distance(st_transform(., utm), wbound_m)) / 1000,
+    displace_km   = if_else(urban_rural == "urban", 2, 5),
+    boundary_flag = if_else(dist_bound_km < displace_km, 1L, 0L))
+
+message("Clusters within displacement radius of a boundary: ",
+        sum(cluster_woreda$boundary_flag), " / ", nrow(cluster_woreda))
+
+# ---- Attach and save --------------------------------------------------------
+lookup <- cluster_woreda %>% st_drop_geometry() %>%
+  select(survey_year, cluster, region, zone, woreda, woreda_id,
+         dist_bound_km, boundary_flag, snapped)
+
+cluster_final <- cluster_level %>% left_join(lookup, by = c("survey_year","cluster"))
+child_final   <- child_merged  %>% left_join(lookup, by = c("survey_year","cluster"))
+
+saveRDS(cluster_final, "data/clean/pipeline/cluster_final.rds")
+saveRDS(child_final,   "data/clean/pipeline/child_final.rds")
+write_csv(cluster_final, "data/clean/pipeline/cluster_final.csv")
+message("All ", nrow(cluster_final), " clusters assigned to a woreda.")
+```
+
+```{r load-analysis-files}
+need <- c("data/clean/pipeline/child_final.rds",
+          "data/clean/pipeline/cluster_final.rds")
+if (!all(file.exists(need)))
+  stop("Analysis files missing. Render with -P rebuild_data:true ",
+       "(requires data/raw) or run the pipeline scripts first.")
+
+child   <- readRDS("data/clean/pipeline/child_final.rds")
+cluster <- readRDS("data/clean/pipeline/cluster_final.rds")
+adm3 <- read_sf("data/raw/eth_admin_boundaries.shp/eth_admin3.shp") %>%
+  st_make_valid() %>%
+  transmute(woreda_id = adm3_pcode, region = adm1_name, zone = adm2_name,
+            woreda = adm3_name)
+adm1 <- read_sf("data/raw/eth_admin_boundaries.shp/eth_admin1.shp") %>%
+  st_make_valid()
+```
+
+# 3. Descriptive analysis
+
+```{r child-labels}
+child_t <- child %>%
+  filter(!is.na(zero_dose)) %>%
+  mutate(
+    zero_dose_f = factor(zero_dose, levels = c(0, 1),
+                         labels = c("Vaccinated (DTP1+)", "Zero dose")),
+    child_sex_f = factor(child_sex, levels = c(1, 2),
+                         labels = c("Male", "Female")),
+    mother_educ = fct_relabel(mother_educ, str_to_sentence),
+    wealth_q    = fct_relabel(wealth_q, str_to_sentence),
+    residence   = fct_relabel(residence, str_to_sentence)) %>%
+  set_variable_labels(
+    age_months  = "Age (months)",
+    child_sex_f = "Child sex",
+    birth_order = "Birth order",
+    mother_educ = "Mother's education",
+    wealth_q    = "Household wealth quintile",
+    residence   = "Residence",
+    zero_dose_f = "Vaccination status")
+```
+
+## Table 1. Sample characteristics by survey round (unweighted)
+
+```{r tbl1-characteristics}
+tbl1 <- child_t %>%
+  select(survey_year, age_months, child_sex_f, birth_order, mother_educ,
+         wealth_q, residence, zero_dose_f) %>%
+  tbl_summary(
+    by = survey_year,
+    statistic = list(all_continuous()  ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = all_continuous() ~ 1,
+    missing = "no") %>%
+  add_overall() %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**EDHS survey round**") %>%
+  modify_caption("Table 1. Characteristics of living children aged 12 to 23
+    months with known DTP1 status, EDHS 2011 to 2019 (unweighted)")
+tbl1
+```
+
+## Table 2. Design-weighted sample profile and national zero-dose prevalence
+
+```{r tbl2-weighted}
+des_t <- svydesign(ids = ~psu, strata = ~strata, weights = ~wt,
+                   data = child_t, nest = TRUE)
+
+tbl2 <- tbl_svysummary(
+    des_t,
+    by = survey_year,
+    include = c(zero_dose_f, residence, child_sex_f, mother_educ, wealth_q),
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    digits = all_categorical() ~ 1,
+    missing = "no") %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**EDHS survey round (weighted %)**") %>%
+  modify_caption("Table 2. Design-weighted distribution of the analysis sample
+    and national zero-dose prevalence by round (DHS weights, wt = v005/1e6)")
+tbl2
+```
+
+## Table 3. Weighted zero-dose prevalence by subgroup and round
+
+Row percentages within each subgroup: the "Zero dose" column is the weighted
+zero-dose prevalence for that subgroup.
+
+```{r tab2-subgroup-csv}
+# Subgroup prevalence CSV (kept from the original pipeline for downstream use)
+wtd_mean <- function(x, w) sum(x * w, na.rm = TRUE) / sum(w[!is.na(x)], na.rm = TRUE)
+
+by_group <- function(v) child %>%
+  filter(!is.na(zero_dose), !is.na(.data[[v]])) %>%
+  group_by(survey_year, group = as.character(.data[[v]])) %>%
+  summarise(n_children = n(),
+            zero_dose_wtd = wtd_mean(zero_dose, wt) * 100, .groups = "drop") %>%
+  mutate(variable = v, .before = 1)
+
+tab2 <- bind_rows(by_group("residence"), by_group("wealth_q"),
+                  by_group("mother_educ"), by_group("child_sex"))
+write_csv(tab2, "data/clean/pipeline/tables/tab2_subgroup_prevalence.csv")
+```
+
+```{r tbl3-subgroups}
+tbl3 <- child_t %>%
+  select(survey_year, wt, psu, strata, zero_dose_f, residence, child_sex_f,
+         mother_educ, wealth_q) %>%
+  tbl_strata(
+    strata = survey_year,
+    .tbl_fun = ~ .x %>%
+      { svydesign(ids = ~psu, strata = ~strata, weights = ~wt,
+                  data = ., nest = TRUE) } %>%
+      tbl_svysummary(
+        by = zero_dose_f,
+        include = c(residence, child_sex_f, mother_educ, wealth_q),
+        percent = "row",
+        statistic = all_categorical() ~ "{p}%",
+        digits = all_categorical() ~ 1,
+        missing = "no") %>%
+      modify_header(all_stat_cols() ~ "**{level}**"),
+    .header = "**EDHS {strata}**") %>%
+  modify_caption("Table 3. Design-weighted zero-dose prevalence by subgroup
+    (row % within each characteristic), by survey round")
+tbl3
+```
+
+## Table 4. Design-based zero-dose prevalence by current admin-1 region and round
+
+Regions come from the OCHA admin-1 boundaries via the cluster-to-woreda
+spatial join (`region` = adm1_name), so all current regions are reported
+(Sidama, South West Ethiopia, Central Ethiopia, South Ethiopia, etc.) instead
+of the survey-era DHS regions such as SNNP.
+
+```{r tbl4-region}
+des <- svydesign(ids = ~psu, strata = ~strata, weights = ~wt,
+                 data = child %>% filter(!is.na(zero_dose)), nest = TRUE)
+
+tab3 <- svyby(~zero_dose, ~region + survey_year, des, svymean,
+              na.rm = TRUE) %>%
+  as_tibble() %>%
+  mutate(prev_pct = zero_dose * 100, se_pct = se * 100,
+         lo = pmax(0, prev_pct - 1.96 * se_pct),
+         hi = pmin(100, prev_pct + 1.96 * se_pct)) %>%
+  select(region, survey_year, prev_pct, lo, hi)
+write_csv(tab3, "data/clean/pipeline/tables/tab3_region_prevalence.csv")
+
+tbl4 <- tab3 %>%
+  mutate(cell = sprintf("%.1f (%.1f, %.1f)", prev_pct, lo, hi)) %>%
+  select(region, survey_year, cell) %>%
+  pivot_wider(names_from = survey_year, values_from = cell) %>%
+  arrange(desc(parse_number(`2019`))) %>%
+  gt(rowname_col = "region") %>%
+  tab_header(
+    title = "Table 4. Zero-dose prevalence by current admin-1 region and survey round",
+    subtitle = "Design-based estimates, % (95% CI); Taylor-linearized SEs;
+      regions assigned via GPS cluster-to-woreda join on OCHA boundaries") %>%
+  tab_spanner(label = "EDHS survey round", columns = c(`2011`, `2016`, `2019`)) %>%
+  tab_stubhead(label = "Region (admin 1)") %>%
+  sub_missing(missing_text = "no clusters") %>%
+  tab_source_note("Source: EDHS 2011, 2016, 2019 children's recode; living
+    children 12 to 23 months; svydesign(ids = psu, strata, weights = wt).") %>%
+  opt_align_table_header("left")
+tbl4
+```
+
+## Table 5. Cluster and woreda coverage summary
+
+```{r tbl5-coverage}
+tab1 <- child %>% filter(!is.na(zero_dose)) %>%
+  group_by(survey_year) %>%
+  summarise(n_clusters = n_distinct(cluster), n_children = n(),
+            zero_dose_unwtd = mean(zero_dose) * 100,
+            zero_dose_wtd   = weighted.mean(zero_dose, wt) * 100,
+            .groups = "drop")
+write_csv(tab1, "data/clean/pipeline/tables/tab1_round_summary.csv")
+
+tab4 <- cluster %>% group_by(survey_year) %>%
+  summarise(n_clusters = n(), mean_children = mean(n_children),
+            median_children = median(n_children),
+            mean_prev = mean(prevalence, na.rm = TRUE) * 100, .groups = "drop")
+write_csv(tab4, "data/clean/pipeline/tables/tab4_cluster_summary.csv")
+
+tbl5 <- tab1 %>%
+  left_join(tab4 %>% select(survey_year, mean_children, median_children),
+            by = "survey_year") %>%
+  gt(rowname_col = "survey_year") %>%
+  tab_header(
+    title = "Table 5. Survey coverage and national zero-dose prevalence by round",
+    subtitle = "Geolocated clusters and children 12 to 23 months with known DTP1 status") %>%
+  cols_label(n_clusters = "Clusters", n_children = "Children",
+             zero_dose_unwtd = "Crude %", zero_dose_wtd = "Weighted %",
+             mean_children = "Mean", median_children = "Median") %>%
+  tab_spanner(label = "Zero-dose prevalence",
+              columns = c(zero_dose_unwtd, zero_dose_wtd)) %>%
+  tab_spanner(label = "Children per cluster",
+              columns = c(mean_children, median_children)) %>%
+  fmt_number(columns = c(zero_dose_unwtd, zero_dose_wtd, mean_children),
+             decimals = 1) %>%
+  tab_stubhead(label = "EDHS round") %>%
+  opt_align_table_header("left")
+tbl5
+```
+
+## Figures: national trend and regional intervals
+
+```{r fig-trend}
+#| fig-width: 7
+#| fig-height: 4.5
+f1 <- ggplot(tab1, aes(survey_year, zero_dose_wtd)) +
+  geom_line(colour = "#B2182B") + geom_point(size = 2.5, colour = "#B2182B") +
+  scale_x_continuous(breaks = c(2011, 2016, 2019)) +
+  labs(title = "National zero-dose prevalence (weighted), children 12-23 months",
+       x = NULL, y = "Zero-dose (%)") + theme_minimal(base_size = 12)
+ggsave("data/clean/pipeline/figures/fig1_national_trend.png", f1,
+       width = 7, height = 4.5, dpi = 300, bg = "white")
+f1
+```
+
+```{r fig-region-ci}
+#| fig-width: 7
+#| fig-height: 5.5
+f2 <- tab3 %>% filter(survey_year == 2019) %>%
+  ggplot(aes(reorder(region, prev_pct), prev_pct)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), colour = "#2166AC") +
+  coord_flip() +
+  labs(title = "Zero-dose prevalence by current admin-1 region, EDHS 2019 (95% CI)",
+       x = NULL, y = "Zero-dose (%)") + theme_minimal(base_size = 12)
+ggsave("data/clean/pipeline/figures/fig2_region_2019_ci.png", f2,
+       width = 7, height = 5.5, dpi = 300, bg = "white")
+f2
+```
+
+## Woreda summary and descriptive maps
+
+```{r woreda-summary}
+woreda_sum <- cluster %>% group_by(woreda_id) %>%
+  summarise(n_clusters = n(), n_rounds = n_distinct(survey_year),
+            n_children = sum(n_children), n_zero_dose = sum(n_zero_dose),
+            obs_prev = if_else(n_children > 0, n_zero_dose / n_children, NA_real_),
+            .groups = "drop")
+
+adm3_sum <- adm3 %>% left_join(woreda_sum, by = "woreda_id") %>%
+  mutate(sampled = if_else(!is.na(n_children) & n_children > 0,
+                           "Sampled", "Unsampled"),
+         across(c(n_clusters, n_children, n_zero_dose),
+                ~replace_na(as.numeric(.x), 0)))
+saveRDS(adm3_sum, "data/clean/pipeline/adm3_summary_sf.rds")
+
+adm3_sum %>% st_drop_geometry() %>%
+  write_csv("data/clean/pipeline/tables/tab5_woreda_summary.csv")
+
+message("Sampled woredas: ", sum(adm3_sum$sampled == "Sampled"),
+        " | Unsampled: ", sum(adm3_sum$sampled == "Unsampled"))
+```
+
+### Table 6. Woreda sampling coverage
+
+```{r tbl6-woreda-coverage}
+tbl6 <- adm3_sum %>% st_drop_geometry() %>%
+  group_by(sampled) %>%
+  summarise(n_woredas = n(),
+            total_children = sum(n_children),
+            total_zero_dose = sum(n_zero_dose), .groups = "drop") %>%
+  gt(rowname_col = "sampled") %>%
+  tab_header(
+    title = "Table 6. Woreda-level DHS coverage, OCHA admin-3 geography",
+    subtitle = "Pooled EDHS 2011 to 2019 clusters across 1,148 woredas") %>%
+  cols_label(n_woredas = "Woredas",
+             total_children = "Children (12-23 mo)",
+             total_zero_dose = "Zero-dose children") %>%
+  fmt_integer(columns = everything()) %>%
+  grand_summary_rows(columns = c(n_woredas, total_children, total_zero_dose),
+                     fns = list(Total = ~sum(.)),
+                     fmt = ~fmt_integer(.)) %>%
+  tab_stubhead(label = "DHS status") %>%
+  opt_align_table_header("left")
+tbl6
+```
+
+```{r maps-descriptive}
+#| fig-width: 9
+#| fig-height: 8
+cluster_sf <- st_as_sf(cluster, coords = c("longnum","latnum"), crs = 4326,
+                       remove = FALSE)
+
+p1 <- ggplot() +
+  geom_sf(data = adm3_sum, aes(fill = sampled), colour = "white", linewidth = 0.08) +
+  geom_sf(data = adm1, fill = NA, colour = "grey20", linewidth = 0.45) +
+  geom_sf(data = cluster_sf, aes(colour = factor(survey_year)),
+          size = 0.95, alpha = 0.75, shape = 16) +
+  scale_fill_manual(values = c(Sampled = "grey65", Unsampled = "#FFD92F"),
+                    name = "Woreda status") +
+  scale_colour_manual(values = c(`2011` = "#1B9E77", `2016` = "#7570B3",
+                                 `2019` = "#D95F02"), name = "EDHS cluster",
+                      guide = guide_legend(override.aes = list(size = 2))) +
+  labs(title = "DHS cluster coverage across Ethiopian woredas",
+       subtitle = "Pooled EDHS 2011-2019 | grey = sampled, yellow = unsampled") +
+  theme_map
+save_map(p1, "map01_sampled_unsampled_clusters.png")
+p1
+
+p2 <- ggplot(adm3_sum) +
+  geom_sf(aes(fill = if_else(n_children > 0, n_children, NA_real_)),
+          colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "mako", direction = -1, trans = "log10",
+                       na.value = "#FFD92F", name = "Children\n(12-23 mo)") +
+  labs(title = "Sampled children per woreda (pooled)",
+       subtitle = "Yellow = no DHS clusters") + theme_map
+save_map(p2, "map02_children_per_woreda.png")
+p2
+
+p3 <- ggplot(adm3_sum) +
+  geom_sf(aes(fill = if_else(sampled == "Sampled", n_zero_dose, NA_real_)),
+          colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "rocket", direction = -1,
+                       na.value = "#FFD92F", name = "Zero-dose\nchildren") +
+  labs(title = "Zero-dose children per woreda (observed counts, pooled)",
+       subtitle = "Yellow = no DHS clusters") + theme_map
+save_map(p3, "map03_zero_dose_counts.png")
+p3
+
+p4 <- ggplot(adm3_sum) +
+  geom_sf(aes(fill = obs_prev), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1),
+                       na.value = "#FFD92F", name = "Observed\nprevalence") +
+  labs(title = "Observed zero-dose prevalence (sampled woredas only)",
+       subtitle = "Unstable where few children sampled | yellow = unsampled") +
+  theme_map
+save_map(p4, "map04_observed_prevalence.png")
+p4
+
+p5 <- ggplot() +
+  geom_sf(data = adm3_sum, fill = "grey92", colour = "grey70", linewidth = 0.08) +
+  geom_sf(data = adm1, fill = NA, colour = "grey20", linewidth = 0.45) +
+  geom_sf(data = cluster_sf %>% filter(n_children > 0),
+          aes(size = n_children, colour = n_zero_dose / n_children),
+          alpha = 0.65, shape = 16) +
+  scale_size_continuous(range = c(0.4, 3), name = "Children") +
+  scale_colour_viridis_c(option = "inferno", direction = -1,
+                         labels = percent_format(accuracy = 1),
+                         name = "Cluster ZD\nprevalence") +
+  labs(title = "DHS clusters: sample size and zero-dose prevalence") + theme_map
+save_map(p5, "map05_cluster_children_prevalence.png")
+p5
+```
+
+# 4. Stage 1: direct estimates for sampled woredas
+
+Design-weighted zero-dose prevalence pooled across rounds. Because most
+sampled woredas contain a single cluster, a Taylor-linearized design variance
+is undefined for them; 95% CIs therefore use the Wilson score interval on the
+Kish effective sample size, n_eff = (sum w)^2 / sum w^2.
+
+```{r stage1}
+library(dplyr)
+library(tidyr)
+library(binom)
+library(readr)
+
+stage1 <- child %>%
+  filter(!is.na(zero_dose), !is.na(woreda_id)) %>%
+  group_by(woreda_id,  region, zone,  woreda) %>%
+  summarise(
+    n_clusters = n_distinct(paste(survey_year, cluster)),
+    n_rounds   = n_distinct(survey_year),
+    n_children = n(),
+    n_zero     = sum(zero_dose),
+    prev_unwtd = mean(zero_dose),
+    prev_wtd = sum(zero_dose * wt) / sum(wt),
+    n_eff = sum(wt)^2 / sum(wt^2), .groups = "drop") %>%
+  rowwise() %>%
+  mutate(
+    ci = list(binom.confint(x = prev_wtd * n_eff, n = n_eff,
+                            methods = "wilson"))) %>%
+  unnest_wider(ci) %>%
+  rename(lower = lower,  upper = upper) %>%
+  mutate(
+    ci_width = upper - lower,
+    reliability =
+      case_when(
+        n_children >= 25 ~ "adequate (n>=25)",
+        n_children >= 10 ~ "low (10-24)",
+        TRUE ~ "very low (<10)"))
+
+write_csv(stage1, "data/clean/pipeline/tables/stage1_direct_estimates.csv")
+```
+
+
+
+## Table 7. Reliability profile of the direct estimates
+
+```{r tbl7-reliability}
+tbl7 <- stage1 %>%
+  mutate(reliability = factor(reliability,
+           levels = c("adequate (n>=25)", "low (10-24)", "very low (<10)"),
+           labels = c("Adequate (n >= 25)", "Low (n = 10-24)",
+                      "Very low (n < 10)"))) %>%
+  select(reliability, n_children, n_eff, ci_width) %>%
+  set_variable_labels(
+    n_children = "Children per woreda",
+    n_eff      = "Kish effective sample size",
+    ci_width   = "Wilson 95% CI width") %>%
+  tbl_summary(
+    by = reliability,
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    digits = list(n_children ~ 0, n_eff ~ 1, ci_width ~ 2)) %>%
+  add_n() %>%
+  modify_header(label ~ "**Precision measure**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Reliability class (sampled woredas)**") %>%
+  modify_caption("Table 7. Precision of Stage 1 direct estimates by
+    reliability class; wide intervals in small woredas motivate Stage 2")
+tbl7
+```
+
+## Table 8. Direct estimates, adequate-reliability woredas (n >= 25)
+
+```{r tbl8-direct}
+tbl8 <- stage1 %>%
+  filter(n_children >= 25) %>%
+  arrange(desc(prev_wtd)) %>%
+  transmute(region, woreda,
+            n_clusters, n_children, n_eff,
+            crude = prev_unwtd * 100, weighted = prev_wtd * 100,
+            ci = sprintf("(%.1f, %.1f)", lower * 100, upper * 100)) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 8. Survey crude vs design-weighted direct estimates",
+    subtitle = "Sampled woredas with adequate reliability (n >= 30 children),
+      pooled EDHS 2011 to 2019") %>%
+  cols_label(region = "Region", woreda = "Woreda",
+             n_clusters = "Clusters", n_children = "Children",
+             n_eff = "Effective n",
+             crude = "Crude %", weighted = "Weighted %",
+             ci = "Wilson 95% CI") %>%
+  tab_spanner(label = "Sample", columns = c(n_clusters, n_children, n_eff)) %>%
+  tab_spanner(label = "Zero-dose prevalence",
+              columns = c(crude, weighted, ci)) %>%
+  fmt_number(columns = c(n_eff, crude, weighted), decimals = 1) %>%
+  tab_source_note("Weighted prevalence uses DHS child weights; CIs are Wilson
+    score intervals on the Kish effective sample size.") %>%
+  opt_align_table_header("left")
+tbl8
+```
+
+## Stage 1 map and precision figure
+
+```{r map-stage1}
+#| fig-width: 9
+#| fig-height: 8
+adm1_ocha <- read_sf("data/raw/ocha_admin/eth_admin1_ocha.gpkg") %>%
+  st_make_valid()
+
+map_sf1 <- adm3_sum %>% select(woreda_id) %>%
+  left_join(stage1, by = "woreda_id")
+
+ps1 <- ggplot(map_sf1) +
+  geom_sf(aes(fill = prev_wtd), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = map_sf1 %>% filter(reliability == "very low (<10)" |
+                                      is.na(prev_wtd)),
+          fill = NA, colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1),
+                       na.value = "#FFD92F", name = "Direct\nprevalence") +
+  labs(title = "STAGE 1: Direct (weighted) zero-dose prevalence, sampled woredas",
+       subtitle = "Pooled EDHS 2011-2019 | yellow = no DHS data (handled in Stage 2)") +
+  theme_map
+ggsave("data/clean/pipeline/maps/map_s1_direct_estimates.png", ps1,
+       width = 9, height = 8, dpi = 300, bg = "white")
+ps1
+```
+
+```{r fig-ci-width}
+#| fig-width: 7
+#| fig-height: 5
+pw <- ggplot(stage1, aes(n_children, ci_width)) +
+  geom_point(alpha = 0.4, colour = "#2166AC") +
+  scale_x_log10() +
+  labs(title = "Precision of direct estimates by sample size",
+       x = "Children per woreda (log scale)", y = "95% CI width") +
+  theme_minimal(base_size = 12)
+ggsave("data/clean/pipeline/figures/fig_s1_ci_width.png", pw,
+       width = 7, height = 5, dpi = 300, bg = "white")
+pw
+```
+
+# 5. Covariate build: woreda-level covariates for all 1,148 woredas
+
+Covariate files share the OCHA admin-3 geography (merged by `adm3_pcode` or
+the adm3+adm1 name pair, all verified lossless). Livelihood zone is the modal
+zone from point data; residual gaps take region means; continuous covariates
+are standardized (z-scores).
+
+```{r covariates-build}
+#| eval: !expr params$rebuild_data
+cov_dir <- "data/covariates for all woreda"
+
+# ---- 1. Read sources --------------------------------------------------------
+dist_hf <- read_xlsx(file.path(cov_dir, "Dist_HF.xlsx")) %>%
+  transmute(woreda_id = adm3_pcode, dist_hf = `_mean`)
+
+women <- read_xlsx(file.path(cov_dir, "Women_decision.xlsx")) %>%
+  transmute(woreda_id = adm3_pcode, women_decision = `_mean`)
+
+educ <- read_csv(file.path(cov_dir, "Education.csv"), show_col_types = FALSE) %>%
+  transmute(adm3_name, adm1_name, educ_mean = HWM_sum / HWM_count)
+
+wealth <- read_csv(file.path(cov_dir, "Wealth.csv"), show_col_types = FALSE) %>%
+  transmute(adm3_name, adm1_name, wealth_mean = Educ_sum / Educ_count)
+
+# ---- 2. Merge: pcode where available, name pair otherwise -------------------
+covars0 <- adm3 %>% st_drop_geometry() %>%
+  left_join(dist_hf, by = "woreda_id") %>%
+  left_join(women,   by = "woreda_id") %>%
+  left_join(educ,   by = c("woreda" = "adm3_name", "region" = "adm1_name")) %>%
+  left_join(wealth, by = c("woreda" = "adm3_name", "region" = "adm1_name"))
+
+miss_tab <- covars0 %>%
+  summarise(across(c(dist_hf, educ_mean, wealth_mean, women_decision),
+                   ~sum(is.na(.x))))
+print(miss_tab)
+
+stopifnot(nrow(covars0) == nrow(adm3))
+if (any(miss_tab > 0))
+  warning("Unexpected covariate merge misses; region-mean imputation will apply.")
+
+# ---- 3. Livelihood zones: modal LZTYPE per woreda ---------------------------
+lhz_pts <- read_xlsx(file.path(cov_dir, "ET_LHZ.xlsx")) %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+lhz_mode <- st_join(lhz_pts, adm3 %>% select(woreda_id), join = st_within) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(woreda_id), !is.na(LZTYPE)) %>%
+  count(woreda_id, LZTYPE) %>%
+  group_by(woreda_id) %>% slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(woreda_id, lhz_type = LZTYPE)
+
+# ---- 4. Assemble, impute gaps with region means, standardize ----------------
+covars <- covars0 %>%
+  left_join(lhz_mode, by = "woreda_id") %>%
+  group_by(region) %>%
+  mutate(
+    cov_imputed = if_else(is.na(dist_hf) | is.na(educ_mean) |
+                          is.na(wealth_mean) | is.na(women_decision), 1L, 0L),
+    across(c(dist_hf, educ_mean, wealth_mean, women_decision),
+           ~coalesce(.x, mean(.x, na.rm = TRUE)))) %>%
+  ungroup() %>%
+  mutate(
+    lhz_type = factor(replace_na(as.character(lhz_type), "Unknown")),
+    across(c(dist_hf, educ_mean, wealth_mean, women_decision),
+           ~as.numeric(scale(.x)), .names = "z_{.col}"))
+
+stopifnot(nrow(covars) == nrow(adm3),
+          !any(is.na(covars$z_dist_hf)))
+
+saveRDS(covars, "data/clean/pipeline/woreda_covariates.rds")
+write_csv(covars, "data/clean/pipeline/tables/woreda_covariates.csv")
+message("Covariates for ", nrow(covars), " woredas (",
+        sum(covars$cov_imputed), " imputed; LHZ 'Unknown': ",
+        sum(covars$lhz_type == "Unknown"), ").")
+```
+
+## Table 9. Woreda covariate descriptives
+
+```{r tbl9-covariates}
+covars <- readRDS("data/clean/pipeline/woreda_covariates.rds")
+
+tbl9 <- covars %>%
+  select(dist_hf, educ_mean, wealth_mean, women_decision, lhz_type,
+         cov_imputed) %>%
+  mutate(cov_imputed = factor(cov_imputed, levels = c(0, 1),
+                              labels = c("Observed", "Region-mean imputed"))) %>%
+  set_variable_labels(
+    dist_hf        = "Distance to health facility (mean)",
+    educ_mean      = "Education index (mean)",
+    wealth_mean    = "Wealth index (mean)",
+    women_decision = "Women's decision-making (mean)",
+    lhz_type       = "Livelihood zone type (modal)",
+    cov_imputed    = "Covariate imputation status") %>%
+  tbl_summary(
+    statistic = list(all_continuous()  ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = all_continuous() ~ 2) %>%
+  modify_header(label ~ "**Covariate**") %>%
+  modify_caption("Table 9. Woreda-level covariates for all 1,148 OCHA woredas
+    (raw scale, before standardization); continuous covariates enter the
+    model as z-scores")
+tbl9
+```
+
+# 6. Stage 2 (a): spatial model, adjacency graph, and INLA fits
+
+Binomial BYM2 models on the woreda x round frame. Unsampled woredas enter with
+y = NA, so INLA predicts them through the spatial field and the regression
+part: E(logit p) = intercept + year + X'beta + BYM2. Models compared: mA
+(BYM2 only), mB (BYM2 + covariates, primary candidate), mC (covariates + IID,
+no spatial). PC priors: P(sigma > 1) = 0.01; P(phi < 0.5) = 0.5.
+
+```{r inla-frame}
+adm3_sum <- readRDS("data/clean/pipeline/adm3_summary_sf.rds") %>%
+  mutate(area_id = row_number())
+
+# ---- Adjacency graph (queen) with island repair -----------------------------
+nb <- poly2nb(adm3_sum, queen = TRUE, snap = 1e-6)
+
+islands <- which(card(nb) == 0)
+if (length(islands) > 0) {
+  message("Linking ", length(islands), " island(s) to nearest woreda: ",
+          paste(adm3_sum$woreda[islands], collapse = ", "))
+  cents <- st_coordinates(st_centroid(st_geometry(adm3_sum)))
+  for (i in islands) {
+    d <- sqrt(rowSums((cents - matrix(cents[i, ], nrow(adm3_sum), 2,
+                                      byrow = TRUE))^2)); d[i] <- Inf
+    j <- which.min(d)
+    nb[[i]] <- sort(unique(c(setdiff(nb[[i]], 0L), j)))
+    nb[[j]] <- sort(unique(c(setdiff(nb[[j]], 0L), i)))
+  }
+}
+stopifnot(all(card(nb) > 0), n.comp.nb(nb)$nc == 1)
+graph_path <- "data/clean/pipeline/adm3_queen.graph"
+nb2INLA(graph_path, nb)
+saveRDS(nb, "data/clean/pipeline/nb_object.rds")
+
+# ---- Woreda x round model frame ---------------------------------------------
+woreda_round <- cluster %>%
+  group_by(woreda_id, survey_year) %>%
+  summarise(y = sum(n_zero_dose), n = sum(n_children), .groups = "drop") %>%
+  filter(n > 0)
+
+dat <- expand_grid(woreda_id = adm3_sum$woreda_id,
+                   survey_year = c(2011L, 2016L, 2019L)) %>%
+  left_join(woreda_round, by = c("woreda_id", "survey_year")) %>%
+  left_join(adm3_sum %>% st_drop_geometry() %>%
+              select(woreda_id, area_id, region, zone, woreda, sampled),
+            by = "woreda_id") %>%
+  left_join(covars %>%
+              select(woreda_id, starts_with("z_"), lhz_type, cov_imputed),
+            by = "woreda_id") %>%
+  mutate(n = replace_na(n, 0L),
+         Ntrials = pmax(n, 1L),          # value irrelevant where y is NA
+         year_f  = factor(survey_year))
+
+saveRDS(dat, "data/clean/pipeline/inla_frame.rds")
+message("Model frame: ", nrow(dat), " rows; observed: ", sum(!is.na(dat$y)))
+```
+
+```{r inla-fit}
+library(INLA)
+
+fits_path <- "data/clean/pipeline/inla_fits.rds"
+
+pc_bym2 <- list(prec = list(prior = "pc.prec", param = c(1, 0.01)),
+                phi  = list(prior = "pc",      param = c(0.5, 0.5)))
+pc_prec <- list(prec = list(prior = "pc.prec", param = c(1, 0.01)))
+covs <- "z_dist_hf + z_educ_mean + z_wealth_mean + z_women_decision + lhz_type"
+
+if (params$refit_models || !file.exists(fits_path)) {
+
+  fit1 <- function(f) inla(f, data = dat, Ntrials = dat$Ntrials,
+                           family = "binomial",
+                           control.compute = list(dic = TRUE, waic = TRUE,return.marginals.predictor = TRUE,
+                                                  cpo = TRUE, config = TRUE),
+                           control.predictor = list(compute = TRUE, link = 1))
+
+  message("Fitting mA (BYM2, no covariates) ...")
+  mA <- fit1(y ~ 1 + year_f + f(area_id, model = "bym2", graph = graph_path,
+                                scale.model = TRUE, hyper = pc_bym2))
+
+  message("Fitting mB (BYM2 + covariates) ...")
+  mB <- fit1(as.formula(paste(
+    "y ~ 1 + year_f +", covs,
+    "+ f(area_id, model = 'bym2', graph = graph_path,
+         scale.model = TRUE, hyper = pc_bym2)")))
+
+  message("Fitting mC (covariates + IID, no spatial) ...")
+  dat$area_iid <- dat$area_id
+  mC <- fit1(as.formula(paste(
+    "y ~ 1 + year_f +", covs,
+    "+ f(area_iid, model = 'iid', hyper = pc_prec)")))
+
+  fits <- list(mA_bym2 = mA, mB_bym2_cov = mB, mC_iid_cov = mC)
+  saveRDS(fits, fits_path)
+
+} else {
+  message("Loading saved INLA fits from ", fits_path)
+  fits <- readRDS(fits_path)
+}
+```
+
+## Table 10. Model comparison
+
+```{r tbl10-comparison}
+obs <- !is.na(dat$y)
+comparison <- imap_dfr(fits, ~tibble(
+  model = .y, dic = .x$dic$dic, waic = .x$waic$waic,
+  p_eff = .x$waic$p.eff,
+  log_score = -mean(log(.x$cpo$cpo[obs]), na.rm = TRUE),
+  cpo_fail  = sum(.x$cpo$failure[obs] > 0, na.rm = TRUE)))
+write_csv(comparison, "data/clean/pipeline/tables/model_comparison.csv")
+
+best_row <- which.min(comparison$waic)
+
+tbl10 <- comparison %>%
+  mutate(model = recode(model,
+           mA_bym2     = "mA: BYM2 only",
+           mB_bym2_cov = "mB: BYM2 + covariates",
+           mC_iid_cov  = "mC: IID + covariates")) %>%
+  gt(rowname_col = "model") %>%
+  tab_header(
+    title = "Table 10. Model comparison, binomial woreda x round models",
+    subtitle = "Lower DIC/WAIC/log-score = better; selected model highlighted") %>%
+  cols_label(dic = "DIC", waic = "WAIC", p_eff = "Effective parameters",
+             log_score = "CPO log-score", cpo_fail = "CPO failures") %>%
+  fmt_number(columns = c(dic, waic, p_eff, log_score), decimals = 2) %>%
+  tab_style(style = list(cell_fill(color = "#E8F4EA"),
+                         cell_text(weight = "bold")),
+            locations = list(cells_body(rows = best_row),
+                             cells_stub(rows = best_row))) %>%
+  tab_source_note("PC priors: P(sigma > 1) = 0.01; P(phi < 0.5) = 0.5. Queen
+    adjacency on the OCHA admin-3 geography, fully connected.") %>%
+  opt_align_table_header("left")
+tbl10
+```
+
+## Table 11. Fixed effects, selected model (mB)
+
+```{r tbl11-fixed}
+mB <- fits$mB_bym2_cov
+
+tbl11 <- mB$summary.fixed %>%
+  as_tibble(rownames = "term") %>%
+  transmute(term,
+            est = mean, lo = `0.025quant`, hi = `0.975quant`,
+            or = exp(mean), or_lo = exp(`0.025quant`), or_hi = exp(`0.975quant`)) %>%
+  gt(rowname_col = "term") %>%
+  tab_header(
+    title = "Table 11. Fixed effects, model mB (BYM2 + covariates)",
+    subtitle = "Posterior mean and 95% credible interval; continuous
+      covariates standardized (per 1 SD)") %>%
+  cols_label(est = "Mean", lo = "2.5%", hi = "97.5%",
+             or = "OR", or_lo = "2.5%", or_hi = "97.5%") %>%
+  tab_spanner(label = "Logit scale", columns = c(est, lo, hi)) %>%
+  tab_spanner(label = "Odds-ratio scale", columns = c(or, or_lo, or_hi)) %>%
+  fmt_number(columns = c(est, lo, hi, or, or_lo, or_hi), decimals = 3) %>%
+  tab_stubhead(label = "Term") %>%
+  opt_align_table_header("left")
+tbl11
+```
+
+## Table 12. Hyperparameters, selected model (mB)
+
+```{r tbl12-hyper}
+tbl12 <- mB$summary.hyperpar %>%
+  as_tibble(rownames = "parameter") %>%
+  select(parameter, mean, sd, `0.025quant`, `0.5quant`, `0.975quant`) %>%
+  gt(rowname_col = "parameter") %>%
+  tab_header(
+    title = "Table 12. Hyperparameters, model mB",
+    subtitle = "Phi = spatially structured share of the BYM2 variance") %>%
+  cols_label(mean = "Mean", sd = "SD", `0.025quant` = "2.5%",
+             `0.5quant` = "Median", `0.975quant` = "97.5%") %>%
+  fmt_number(columns = -parameter, decimals = 3) %>%
+  tab_stubhead(label = "Hyperparameter") %>%
+  opt_align_table_header("left")
+tbl12
+```
+
+# 7. Stage 2 (b): predictions for all 1,148 woredas
+
+Posterior mean, 95% CrI, and P(prevalence > 25%) at the 2019 level from the
+selected model. The combined two-stage table carries Stage 1 direct estimates
+(sampled woredas) alongside Stage 2 model estimates (all woredas); the model
+value is the final estimate everywhere because it stabilizes noisy direct
+estimates while reproducing reliable ones (checked in the validation section).
+
+```{r stage2-predictions}
+best <- fits$mB_bym2_cov   # keep in sync with Table 10
+
+# Row-align predictions to the exact frame the model was fitted on. The saved
+# inla_fits.rds may carry more survey rounds than the locally rebuilt `dat`
+# (e.g. a 4-round fit that includes Pathways 2025 = 4,592 rows vs a 3-round
+# `dat` = 3,444 rows). INLA stores the fitting data in `best$.args$data`, whose
+# rows correspond one-to-one with summary.fitted.values / marginals.fitted.values,
+# so using it guarantees each fitted value lands on the right woreda x round.
+fit_frame <- best$.args$data
+if (is.null(fit_frame) ||
+    nrow(fit_frame) != nrow(best$summary.fitted.values))
+  fit_frame <- dat   # fallback: assume local frame matches the fit
+
+pred <- fit_frame %>%
+  mutate(pred_mean = best$summary.fitted.values$mean,
+         pred_lo   = best$summary.fitted.values$`0.025quant`,
+         pred_hi   = best$summary.fitted.values$`0.975quant`,
+         pred_sd   = best$summary.fitted.values$sd)
+
+idx19 <- which(pred$survey_year == 2019L)
+pred$p_exceed_25 <- NA_real_
+
+# Saved fits created without return.marginals.predictor = TRUE have empty
+# marginals.fitted.values. Test the first 2019 marginal; if unusable, fall
+# back to a normal approximation on the logit scale (linear-predictor
+# posterior mean and SD), which is accurate because the posterior is close
+# to Gaussian on that scale.
+# Threshold: 25% (the lowest national weighted prevalence was 22.7% in 2019,
+# so a 10% threshold would be exceeded almost everywhere and not discriminate)
+exceed_thr <- 0.25
+
+marg_usable <- tryCatch({
+  m1 <- best$marginals.fitted.values[[idx19[1]]]
+  is.finite(1 - inla.pmarginal(exceed_thr, m1))
+}, error = function(e) FALSE, warning = function(w) FALSE)
+
+if (isTRUE(marg_usable)) {
+  pred$p_exceed_25[idx19] <- sapply(idx19, function(i)
+    1 - inla.pmarginal(exceed_thr, best$marginals.fitted.values[[i]]))
+} else {
+  message("Predictor marginals not stored in the saved fit; ",
+          "using logit-normal approximation for P(prev > 25%). ",
+          "Set refit_models: true (or delete inla_fits.rds) and rerun the ",
+          "inla-fit chunk for exact marginals.")
+  lp <- best$summary.linear.predictor[idx19, ]
+  pred$p_exceed_25[idx19] <- 1 - pnorm(qlogis(exceed_thr),
+                                       mean = lp$mean, sd = lp$sd)
+}
+
+stage2 <- pred %>% filter(survey_year == 2019L) %>%
+  transmute(woreda_id, region, zone, woreda, sampled,
+            s2_pred = pred_mean, s2_lo = pred_lo, s2_hi = pred_hi,
+            s2_ci_width = pred_hi - pred_lo, p_exceed_25)
+
+combined <- stage2 %>%
+  left_join(stage1 %>%
+              select(woreda_id, n_clusters, n_children, n_zero,
+                     s1_direct = prev_wtd, s1_lo = lower, s1_hi = upper,
+                     reliability),
+            by = "woreda_id") %>%
+  mutate(across(c(n_clusters, n_children, n_zero), ~replace_na(.x, 0)),
+         final_estimate = s2_pred, final_lo = s2_lo, final_hi = s2_hi,
+         estimate_source = if_else(sampled == "Sampled",
+                                   "Stage 2 model (informed by own data)",
+                                   "Stage 2 model (spatial + covariates)"))
+write_csv(combined, "data/clean/pipeline/tables/final_two_stage_estimates.csv")
+message("Combined estimates written for ", nrow(combined), " woredas.")
+```
+
+## Table 13. Priority woredas: highest probability of exceeding 25% zero-dose
+
+```{r tbl13-priority}
+tbl13 <- combined %>%
+  arrange(desc(p_exceed_25), desc(final_estimate)) %>%
+  slice_head(n = 30) %>%
+  transmute(region, zone, woreda, sampled,
+            est = final_estimate * 100,
+            cri = sprintf("(%.1f, %.1f)", final_lo * 100, final_hi * 100),
+            p_exceed_25, n_children) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 13. Top 25 priority woredas by P(prevalence > 25%), 2019 level",
+    subtitle = "Selected model (mB: BYM2 + covariates); exceedance probability
+      integrates estimate and uncertainty for targeting") %>%
+  cols_label(region = "Region", zone = "Zone", woreda = "Woreda",
+             sampled = "DHS status", est = "Predicted %",
+             cri = "95% CrI", p_exceed_25 = "P(> 25%)",
+             n_children = "Sampled children") %>%
+  fmt_number(columns = est, decimals = 1) %>%
+  fmt_number(columns = p_exceed_25, decimals = 3) %>%
+  fmt_integer(columns = n_children) %>%
+  tab_source_note("Unsampled woredas (0 sampled children) are predicted via
+    covariates and spatial neighbor borrowing in one joint posterior.") %>%
+  opt_align_table_header("left")
+tbl13
+```
+
+## Table 14. Two-stage estimates by DHS status (summary)
+
+```{r tbl14-twostage-summary}
+tbl14 <- combined %>%
+  select(sampled, final_estimate, s2_ci_width, p_exceed_25) %>%
+  mutate(final_estimate = final_estimate * 100,
+         s2_ci_width = s2_ci_width * 100) %>%
+  set_variable_labels(
+    final_estimate = "Predicted zero-dose prevalence (%)",
+    s2_ci_width    = "95% CrI width (percentage points)",
+    p_exceed_25    = "P(prevalence > 25%)") %>%
+  tbl_summary(
+    by = sampled,
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    digits = all_continuous() ~ 1) %>%
+  add_n() %>%
+  modify_header(label ~ "**Stage 2 output (2019 level)**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Woreda DHS status**") %>%
+  modify_caption("Table 14. Distribution of Stage 2 model estimates and
+    uncertainty by sampling status; unsampled woredas carry wider intervals,
+    as expected")
+tbl14
+```
+
+## Stage 2 maps
+
+```{r maps-stage2}
+#| fig-width: 9
+#| fig-height: 8
+map_sf <- adm3_sum %>% select(woreda_id) %>% left_join(combined, by = "woreda_id")
+
+p6 <- ggplot(map_sf) +
+  geom_sf(aes(fill = final_estimate), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1),
+                       name = "Predicted\nprevalence") +
+  labs(title = "STAGE 2: Zero-dose prevalence, all 1,148 woredas (2019 level)",
+       subtitle = "BYM2 + covariates, pooled EDHS 2011-2019 with round adjustment",
+       caption = "Unsampled woredas predicted via spatial borrowing + covariates") +
+  theme_map
+save_map(p6, "map_s2_predicted_prevalence.png")
+p6
+
+p7 <- ggplot(map_sf) +
+  geom_sf(aes(fill = s2_ci_width), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_viridis_c(option = "mako", direction = -1,
+                       labels = percent_format(accuracy = 1),
+                       name = "95% CrI\nwidth") +
+  labs(title = "Uncertainty of woreda estimates (95% CrI width)") + theme_map
+save_map(p7, "map_s2_uncertainty.png")
+p7
+
+p8 <- ggplot(map_sf) +
+  geom_sf(aes(fill = p_exceed_25), colour = "grey40", linewidth = 0.08) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.45) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0.5, limits = c(0, 1), name = "P(prev > 25%)") +
+  labs(title = "Probability that zero-dose prevalence exceeds 25%",
+       subtitle = "Fold-in uncertainty product for programme targeting") + theme_map
+save_map(p8, "map_s2_exceedance_25pct.png")
+p8
+```
+
+```{r map-s1-vs-s2}
+#| fig-width: 12
+#| fig-height: 7
+comp_df <- bind_rows(
+  map_sf %>% mutate(val = s1_direct,      panel = "Stage 1: direct (sampled only)"),
+  map_sf %>% mutate(val = final_estimate, panel = "Stage 2: model (all woredas)"))
+p9 <- ggplot(comp_df) +
+  geom_sf(aes(fill = val), colour = NA) +
+  geom_sf(data = adm1_ocha, fill = NA, colour = "grey20", linewidth = 0.3) +
+  facet_wrap(~panel) +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       labels = percent_format(accuracy = 1),
+                       na.value = "#FFD92F", name = "Prevalence") +
+  labs(title = "Two-stage results: direct vs model-based zero-dose prevalence",
+       subtitle = "Yellow = no data in Stage 1; Stage 2 fills and stabilises") +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 10, colour = "grey30"),
+        legend.position = "bottom")
+save_map(p9, "map_s1_vs_s2.png", w = 12, h = 7)
+p9
+```
+
+# 8. Validation
+
+Calibration (PIT), in-sample shrinkage, Stage 1 vs Stage 2 agreement among
+reliable direct estimates, and spatial 10-fold cross-validation (hold out
+whole sampled woredas, refit, predict them as if unsampled).
+
+```{r val-pit-shrinkage}
+#| fig-width: 7
+#| fig-height: 5.5
+best_name <- "mB_bym2_cov"
+obs_i <- which(!is.na(dat$y))
+
+# PIT calibration histogram
+png("data/clean/pipeline/figures/val_pit_histogram.png",
+    width = 1800, height = 1400, res = 300)
+hist(best$cpo$pit[obs_i], breaks = 20, col = "grey70", border = "white",
+     main = paste("PIT histogram:", best_name), xlab = "PIT")
+abline(h = length(obs_i) / 20, col = "red", lty = 2)
+dev.off()
+hist(best$cpo$pit[obs_i], breaks = 20, col = "grey70", border = "white",
+     main = paste("PIT histogram:", best_name), xlab = "PIT")
+abline(h = length(obs_i) / 20, col = "red", lty = 2)
+
+# In-sample shrinkage
+ins <- dat[obs_i, ] %>%
+  mutate(fitted = best$summary.fitted.values$mean[obs_i], direct = y / n)
+png("data/clean/pipeline/figures/val_obs_vs_fitted.png",
+    width = 1800, height = 1600, res = 300)
+plot(ins$direct, ins$fitted, cex = sqrt(ins$n) / 4, pch = 16,
+     col = rgb(0, 0, 0, 0.3), xlab = "Direct (y/n)", ylab = "Posterior mean",
+     main = "In-sample shrinkage (point size ~ n)")
+abline(0, 1, col = "red")
+dev.off()
+plot(ins$direct, ins$fitted, cex = sqrt(ins$n) / 4, pch = 16,
+     col = rgb(0, 0, 0, 0.3), xlab = "Direct (y/n)", ylab = "Posterior mean",
+     main = "In-sample shrinkage (point size ~ n)")
+abline(0, 1, col = "red")
+```
+
+```{r val-agreement}
+# Stage-1 vs Stage-2 agreement (reliable woredas only, n >= 30)
+s1r <- stage1 %>% filter(n_children >= 30)
+agr <- s1r %>% inner_join(combined %>% select(woreda_id, s2_pred),
+                          by = "woreda_id")
+agree <- tibble(
+  metric = c("n reliable woredas (n>=30)", "correlation s1 vs s2",
+             "weighted RMSE s1 vs s2"),
+  value = round(c(nrow(agr), cor(agr$prev_wtd, agr$s2_pred),
+                  sqrt(weighted.mean((agr$prev_wtd - agr$s2_pred)^2,
+                                     agr$n_children))), 4))
+```
+
+```{r val-cv}
+#| eval: !expr params$run_cv
+# Spatial 10-fold CV: slow (10 INLA refits). Enable with -P run_cv:true
+form <- as.formula(paste(
+  "y_cv ~ 1 + year_f +", covs,
+  "+ f(area_id, model = 'bym2', graph = graph_path,
+       scale.model = TRUE, hyper = pc_bym2)"))
+
+sampled_ids <- dat %>% filter(!is.na(y)) %>% distinct(area_id) %>% pull()
+folds <- split(sample(sampled_ids), rep_len(1:10, length(sampled_ids)))
+
+cv_res <- map_dfr(seq_along(folds), function(k) {
+  message("CV fold ", k, "/10")
+  d <- dat
+  hold <- d$area_id %in% folds[[k]] & !is.na(d$y)
+  d$y_cv <- d$y; d$y_cv[hold] <- NA
+  fit <- inla(form, data = d, Ntrials = d$Ntrials, family = "binomial",
+              control.predictor = list(compute = TRUE, link = 1))
+  tibble(fold = k, area_id = d$area_id[hold], year = d$survey_year[hold],
+         n = d$n[hold], direct = d$y[hold] / d$n[hold],
+         pred = fit$summary.fitted.values$mean[hold],
+         lo = fit$summary.fitted.values$`0.025quant`[hold],
+         hi = fit$summary.fitted.values$`0.975quant`[hold])
+})
+write_csv(cv_res, "data/clean/pipeline/tables/cv_results.csv")
+```
+
+## Table 15. Validation summary
+
+```{r tbl15-validation}
+cv_path <- "data/clean/pipeline/tables/cv_results.csv"
+
+if (file.exists(cv_path)) {
+  cv_res <- read_csv(cv_path, show_col_types = FALSE)
+  cv_sum <- cv_res %>%
+    mutate(se_bin = sqrt(pred * (1 - pred) / n),
+           covered = direct >= pmax(0, lo - 1.96 * se_bin) &
+                     direct <= pmin(1, hi + 1.96 * se_bin)) %>%
+    summarise(rmse = sqrt(weighted.mean((pred - direct)^2, n)),
+              mae = weighted.mean(abs(pred - direct), n),
+              corr = cor(pred, direct), coverage = mean(covered))
+  validation <- bind_rows(
+    agree,
+    tibble(metric = c("CV weighted RMSE", "CV weighted MAE",
+                      "CV correlation", "CV 95% interval coverage"),
+           value = round(c(cv_sum$rmse, cv_sum$mae,
+                           cv_sum$corr, cv_sum$coverage), 4)))
+} else {
+  validation <- agree
+  message("Spatial CV results not found; showing agreement metrics only. ",
+          "Render with -P run_cv:true to add cross-validation.")
+}
+write_csv(validation, "data/clean/pipeline/tables/validation_summary.csv")
+
+tbl15 <- validation %>%
+  gt(rowname_col = "metric") %>%
+  tab_header(
+    title = "Table 15. Validation of the selected model (mB)",
+    subtitle = "Agreement with reliable direct estimates and spatial
+      10-fold cross-validation (held-out woredas predicted as if unsampled)") %>%
+  cols_label(value = "Value") %>%
+  fmt_number(columns = value, decimals = 4) %>%
+  tab_source_note("CV interval coverage is checked against noisy direct
+    estimates, so binomial sampling error of the held-out estimate is added
+    to the model interval.") %>%
+  tab_stubhead(label = "Metric") %>%
+  opt_align_table_header("left")
+tbl15
+```
+
